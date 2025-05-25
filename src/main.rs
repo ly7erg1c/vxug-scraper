@@ -20,7 +20,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static RATE_LIMIT_SECS: AtomicU64 = AtomicU64::new(0);
 /// Pause execution waiting for network switching and resume after countdown
 fn pause_for_proxy_change() {
-    eprintln!("[!] Rate limit or network error detected. Waiting for network switching to take effect...");
+    eprintln!("[!] Rate limit or network error detected.");
+    eprintln!("[*] Press Enter to start retry countdown...");
+    let mut _enter = String::new();
+    std::io::stdin().read_line(&mut _enter).unwrap();
+    eprintln!("[*] Waiting for network switching to take effect...");
     for remaining in (1..=10).rev() {
         eprint!("\r[*] Retrying in {} seconds...", remaining);
         std::io::stdout().flush().unwrap();
@@ -131,8 +135,11 @@ async fn scrape_directory(
     visited.insert(current_dir.clone());
     println!("Visited directories: {:?}", visited);
 
-    // fetch page with rate-limit and retry on rate-limit or network errors
+    // fetch page with rate-limit and retry up to 3 times on rate-limit or network errors
+    let mut attempts = 0;
+    let max_attempts = 3;
     let response_text = loop {
+        attempts += 1;
         let rl = RATE_LIMIT_SECS.load(Ordering::Relaxed);
         if rl > 0 {
             sleep(Duration::from_secs(rl)).await;
@@ -141,25 +148,25 @@ async fn scrape_directory(
             Ok(resp) => {
                 let status = resp.status();
                 if !status.is_success() {
-                    eprintln!("[!] HTTP status {} received from {}. Retrying after delay...", status, url);
-                    pause_for_proxy_change();
-                    continue;
-                }
-                match resp.text().await {
-                    Ok(body) => break body,
-                    Err(e) => {
-                        eprintln!("[!] Error reading body from {}: {}. Retrying after delay...", url, e);
-                        pause_for_proxy_change();
-                        continue;
+                    eprintln!("[!] Attempt {}/{}: HTTP status {} received from {}.", attempts, max_attempts, status, url);
+                } else {
+                    match resp.text().await {
+                        Ok(body) => break body,
+                        Err(e) => {
+                            eprintln!("[!] Attempt {}/{}: Error reading body from {}: {}.", attempts, max_attempts, url, e);
+                        }
                     }
                 }
             }
             Err(e) => {
-                eprintln!("[!] HTTP request to {} failed: {}. Retrying after delay...", url, e);
-                pause_for_proxy_change();
-                continue;
+                eprintln!("[!] Attempt {}/{}: HTTP request to {} failed: {}.", attempts, max_attempts, url, e);
             }
         }
+        if attempts >= max_attempts {
+            eprintln!("[!] Failed to fetch {} after {} attempts. Skipping...", url, max_attempts);
+            return Ok(());
+        }
+        pause_for_proxy_change();
     };
     let document = Html::parse_document(&response_text);
 
@@ -202,19 +209,34 @@ async fn scrape_directory(
 
             download_tasks.push(tokio::spawn(async move {
                 println!("Downloading {} to {}", name, file_path);
+                let mut success = false;
                 for attempt in 1..=3 {
                     match download_file(&client, &file_url, &file_path).await {
                         Ok(_) => {
                             println!("Saved {} to {}", name, file_path);
+                            success = true;
                             break;
                         }
                         Err(e) => {
                             eprintln!("Attempt {}/3 failed for {}: {}", attempt, name, e);
                             if attempt < 3 {
-                                sleep(Duration::from_secs(1)).await;
+                                if attempt == 1 {
+                                    pause_for_proxy_change();
+                                } else {
+                                    eprintln!("[*] Waiting for network switching to take effect...");
+                                    for remaining in (1..=10).rev() {
+                                        eprint!("\r[*] Retrying in {} seconds...", remaining);
+                                        std::io::stdout().flush().unwrap();
+                                        sleep(Duration::from_secs(1)).await;
+                                    }
+                                    eprintln!("\r[*] Resuming now...");
+                                }
                             }
                         }
                     }
+                }
+                if !success {
+                    eprintln!("[!] Failed to download {} after 3 attempts, skipping.", name);
                 }
             }));
         }
@@ -271,36 +293,16 @@ async fn scrape_directory(
 }
 
 async fn download_file(client: &Client, url: &str, file_path: &str) -> Result<(), reqwest::Error> {
-    // fetch file with rate-limit and retry on rate-limit or network errors
-    let bytes = loop {
-        let rl = RATE_LIMIT_SECS.load(Ordering::Relaxed);
-        if rl > 0 {
-            sleep(Duration::from_secs(rl)).await;
-        }
-        match client.get(url).send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if !status.is_success() {
-                    eprintln!("[!] HTTP status {} received for {}. Retrying after delay...", status, url);
-                    pause_for_proxy_change();
-                    continue;
-                }
-                match resp.bytes().await {
-                    Ok(b) => break b,
-                Err(e) => {
-                    eprintln!("[!] Error reading bytes from {}: {}. Retrying after delay...", url, e);
-                        pause_for_proxy_change();
-                        continue;
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[!] HTTP request to {} failed: {}. Retrying after delay...", url, e);
-                pause_for_proxy_change();
-                continue;
-            }
-        }
-    };
+    // single attempt fetch with rate-limit, return error on failure
+    let rl = RATE_LIMIT_SECS.load(Ordering::Relaxed);
+    if rl > 0 {
+        sleep(Duration::from_secs(rl)).await;
+    }
+    let resp = client.get(url)
+        .send()
+        .await?
+        .error_for_status()?;
+    let bytes = resp.bytes().await?;
 
     if let Some(parent) = std::path::Path::new(file_path).parent() {
         fs::create_dir_all(parent).unwrap();
