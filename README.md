@@ -81,13 +81,13 @@ cargo run --release -- -r 5 -o /path/to/output Papers
 ```
 
 
-To scrap all the collections. 
+To scrape all the collections. 
 
 ```bash
 cargo run --release
 ```
 
-To Download a particular Collections !
+To download a particular collection !
 
 ```bash
 cargo run -- <Directory of Page>
@@ -97,13 +97,13 @@ Example:
 
 ![vx-ug](./images/image.png)
 
-Im choosing to download Papers so 
+I'm choosing to download Papers so 
 
 ```bash
 cargo run --release -- Papers
 ```
 
-or if you want to download specfic directories for example. i need to download Windows Papers from Paper collections
+or if you want to download specfic directories for example: I need to download Windows Papers from Paper collections.
 
 ![vx-ug-papers](./images/image-1.png)
 
@@ -111,7 +111,7 @@ or if you want to download specfic directories for example. i need to download W
 cargo run --release -- Papers/Windows
 ```
 
-if the path is contains space. add %20 instead of space..
+If the path is contains space. Add %20 instead of space..
 
 ```bash
 cargo run --release -- Papers/Malware%20Defense
