@@ -18,11 +18,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Global rate limit in seconds between HTTP requests (0 = no limit)
 static RATE_LIMIT_SECS: AtomicU64 = AtomicU64::new(0);
-/// Pause execution waiting for user to change proxies
+/// Pause execution waiting for network switching and resume after countdown
 fn pause_for_proxy_change() {
-    eprintln!("[!] Rate limit or network error detected. Please change your proxy and press Enter to resume...");
-    let mut buf = String::new();
-    let _ = std::io::stdin().read_line(&mut buf);
+    eprintln!("[!] Rate limit or network error detected. Waiting for network switching to take effect...");
+    for remaining in (1..=10).rev() {
+        eprint!("\r[*] Retrying in {} seconds...", remaining);
+        std::io::stdout().flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    eprintln!("\r[*] Resuming now...");
 }
 
 
@@ -75,7 +79,7 @@ async fn main() -> Result<(), reqwest::Error> {
     fs::create_dir_all(&root_dir).expect("Unable to create root directory");
 
     let mut start_url = format!("{}/", base_url);
-    if let Some(path) = start_path {
+    if let Some(path) = &start_path {
         start_url = format!("{}/{}", base_url, path);
         match check_url(&start_url) {
             Ok(true) => println!("[+] URL is reachable: {} - STATUS {}", start_url, 200),
@@ -96,7 +100,12 @@ async fn main() -> Result<(), reqwest::Error> {
     println!("Starting scrape at URL: {}", start_url);
 
     let mut visited = HashSet::new();
-    scrape_directory(client, base_url, &start_url, &root_dir, &mut visited).await?;
+    let skip_segments: Vec<String> = if let Some(path) = &start_path {
+        path.split('/').map(|s| s.to_string()).collect()
+    } else {
+        Vec::new()
+    };
+    scrape_directory(client, base_url, &start_url, &root_dir, &mut visited, &skip_segments).await?;
 
     println!("Scraping and downloading complete!");
     Ok(())
@@ -108,6 +117,7 @@ async fn scrape_directory(
     url: &str,
     dir: &str,
     visited: &mut HashSet<String>,
+    skip_segments: &[String],
 ) -> Result<(), reqwest::Error> {
     println!("Processing URL: {} | Saving to directory: {}", url, dir);
 
@@ -131,21 +141,21 @@ async fn scrape_directory(
             Ok(resp) => {
                 let status = resp.status();
                 if !status.is_success() {
-                    eprintln!("[!] HTTP status {} received from {}. Please change proxy and press Enter to retry...", status, url);
+                    eprintln!("[!] HTTP status {} received from {}. Retrying after delay...", status, url);
                     pause_for_proxy_change();
                     continue;
                 }
                 match resp.text().await {
                     Ok(body) => break body,
                     Err(e) => {
-                        eprintln!("[!] Error reading body from {}: {}. Change proxy and press Enter to retry...", url, e);
+                        eprintln!("[!] Error reading body from {}: {}. Retrying after delay...", url, e);
                         pause_for_proxy_change();
                         continue;
                     }
                 }
             }
             Err(e) => {
-                eprintln!("[!] HTTP request to {} failed: {}. Please change proxy and press Enter to retry...", url, e);
+                eprintln!("[!] HTTP request to {} failed: {}. Retrying after delay...", url, e);
                 pause_for_proxy_change();
                 continue;
             }
@@ -222,8 +232,11 @@ async fn scrape_directory(
             .map(|e| e.text().collect::<Vec<_>>().join("").trim().to_string())
             .collect();
 
-        // filter out dirs, if they are visited !
-        categories.retain(|category| !visited.contains(category) && category != &current_dir);
+        categories.retain(|category|
+            !visited.contains(category)
+            && category != &current_dir
+            && !skip_segments.contains(category)
+        );
 
         if categories.is_empty() {
             println!("No subdirectories found at {}", url);
@@ -243,6 +256,7 @@ async fn scrape_directory(
                 &category_url,
                 &category_dir,
                 visited,
+                skip_segments,
             ));
 
             if let Err(e) = recursive_call.await {
@@ -267,21 +281,21 @@ async fn download_file(client: &Client, url: &str, file_path: &str) -> Result<()
             Ok(resp) => {
                 let status = resp.status();
                 if !status.is_success() {
-                    eprintln!("[!] HTTP status {} received for {}. Change proxy and press Enter to retry...", status, url);
+                    eprintln!("[!] HTTP status {} received for {}. Retrying after delay...", status, url);
                     pause_for_proxy_change();
                     continue;
                 }
                 match resp.bytes().await {
                     Ok(b) => break b,
-                    Err(e) => {
-                        eprintln!("[!] Error reading bytes from {}: {}. Change proxy and press Enter to retry...", url, e);
+                Err(e) => {
+                    eprintln!("[!] Error reading bytes from {}: {}. Retrying after delay...", url, e);
                         pause_for_proxy_change();
                         continue;
                     }
                 }
             }
             Err(e) => {
-                eprintln!("[!] HTTP request to {} failed: {}. Change proxy and press Enter to retry...", url, e);
+                eprintln!("[!] HTTP request to {} failed: {}. Retrying after delay...", url, e);
                 pause_for_proxy_change();
                 continue;
             }
