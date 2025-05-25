@@ -68,6 +68,18 @@ cargo run --release
 cargo run --release -- -o /path/to/output Papers
 ```
 
+You can also limit the time between requests using `-r` or `--rate-limit`. For example, wait 5 seconds between each HTTP call:
+
+```bash
+cargo run --release -- -r 5
+```
+
+Or combine with output-dir and collection:
+
+```bash
+cargo run --release -- -r 5 -o /path/to/output Papers
+```
+
 
 To scrap all the collections. 
 

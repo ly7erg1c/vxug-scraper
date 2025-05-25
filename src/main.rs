@@ -14,6 +14,10 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Global rate limit in seconds between HTTP requests (0 = no limit)
+static RATE_LIMIT_SECS: AtomicU64 = AtomicU64::new(0);
 
 
 // async fn => 
@@ -35,6 +39,18 @@ async fn main() -> Result<(), reqwest::Error> {
                     std::process::exit(1);
                 }
                 root_dir = args[i + 1].clone();
+                i += 2;
+            }
+            "-r" | "--rate-limit" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: {} requires a value", args[i]);
+                    std::process::exit(1);
+                }
+                let secs = args[i + 1].parse::<u64>().unwrap_or_else(|_| {
+                    eprintln!("Error: invalid rate-limit value: {}", args[i + 1]);
+                    std::process::exit(1);
+                });
+                RATE_LIMIT_SECS.store(secs, Ordering::Relaxed);
                 i += 2;
             }
             other => {
@@ -99,6 +115,11 @@ async fn scrape_directory(
     visited.insert(current_dir.clone());
     println!("Visited directories: {:?}", visited);
 
+    // apply rate limit between requests if set
+    let rl = RATE_LIMIT_SECS.load(Ordering::Relaxed);
+    if rl > 0 {
+        sleep(Duration::from_secs(rl)).await;
+    }
     let response = client.get(url).send().await?.text().await?;
     let document = Html::parse_document(&response);
 
@@ -206,6 +227,11 @@ async fn scrape_directory(
 }
 
 async fn download_file(client: &Client, url: &str, file_path: &str) -> Result<(), reqwest::Error> {
+    // apply rate limit between requests if set
+    let rl = RATE_LIMIT_SECS.load(Ordering::Relaxed);
+    if rl > 0 {
+        sleep(Duration::from_secs(rl)).await;
+    }
     let response = client.get(url).send().await?;
     let bytes = response.bytes().await?;
 
