@@ -7,6 +7,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use regex::Regex;
 use reqwest::Client;
 use scraper::{Html, Selector};
+use std::path::Path;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fs::{self, File};
@@ -22,45 +23,58 @@ async fn main() -> Result<(), reqwest::Error> {
     let args: Vec<String> = std::env::args().collect();
 
     let base_url = "https://vx-underground.org";
-    let mut start_url = "https://vx-underground.org/".to_string();
-    let root_dir = "Downloads";
+    let mut start_path: Option<String> = None;
+    let mut root_dir = String::from("Downloads");
 
-    fs::create_dir_all(root_dir).expect("Unable to create root directory");
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--output-dir" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: {} requires a value", args[i]);
+                    std::process::exit(1);
+                }
+                root_dir = args[i + 1].clone();
+                i += 2;
+            }
+            other => {
+                if start_path.is_some() {
+                    eprintln!("Warning: multiple paths specified, using first: {}", other);
+                } else {
+                    start_path = Some(other.to_string());
+                }
+                i += 1;
+            }
+        }
+    }
 
     banner();
 
-    if args.len() > 1 {
-        start_url = format!("https://vx-underground.org/{}", args[1]);
+    fs::create_dir_all(&root_dir).expect("Unable to create root directory");
 
+    let mut start_url = format!("{}/", base_url);
+    if let Some(path) = start_path {
+        start_url = format!("{}/{}", base_url, path);
         match check_url(&start_url) {
-            Ok(is_success) => {
-                if is_success {
-                    println!("[+] URL is reachable: {} - STATUS {}", start_url, 200);
-                }
-            }
-
+            Ok(true) => println!("[+] URL is reachable: {} - STATUS {}", start_url, 200),
+            Ok(false) => eprintln!("[!] URL not reachable: {}", start_url),
             Err(e) => eprintln!("Error while checking URL: {}", e),
         }
-
-        println!(
-            "[+] Specfic Parameter Detected. Downloading {} Collections...",
-            args[1]
-        );
-
+        println!("[+] Downloading collection: {}", path);
     } else {
-        println!("[+] No Parameter Detected. Starting to Download All Collections ...")
+        println!("[+] No parameter detected. Starting to download all collections...");
     }
 
     println!("[*] Press Enter to Start Processing =>");
 
-    let _ = std::io::stdin().read_line(&mut String::new()).unwrap();
-    let _ = std::io::stdout().flush();
+    std::io::stdin().read_line(&mut String::new()).unwrap();
+    std::io::stdout().flush().unwrap();
 
     let client = Arc::new(Client::builder().build()?);
     println!("Starting scrape at URL: {}", start_url);
 
     let mut visited = HashSet::new();
-    scrape_directory(client, base_url, &start_url, root_dir, &mut visited).await?;
+    scrape_directory(client, base_url, &start_url, &root_dir, &mut visited).await?;
 
     println!("Scraping and downloading complete!");
     Ok(())
@@ -115,6 +129,10 @@ async fn scrape_directory(
         for (name, href) in links {
             let client = Arc::clone(&client);
             let file_path = format!("{}/{}", dir, name);
+            if Path::new(&file_path).exists() {
+                println!("Skipping {}: already exists at {}", name, file_path);
+                continue;
+            }
             let file_url = if href.starts_with("http") {
                 href
             } else {

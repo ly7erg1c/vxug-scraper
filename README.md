@@ -58,7 +58,15 @@ cargo run --release
 
 ### USAGE:
 
-> ⚠️ Use Tool with Caution. You may get banned temporary if you misuse this tool !
+ > ⚠️ Use Tool with Caution. You may get banned temporary if you misuse this tool !
+ 
+ You can optionally specify an output directory with `-o` or `--output-dir`. If not provided, defaults to `Downloads`.
+ 
+ Example: Download the "Papers" collection to a custom directory:
+ 
+```bash
+cargo run --release -- -o /path/to/output Papers
+```
 
 
 To scrap all the collections. 
