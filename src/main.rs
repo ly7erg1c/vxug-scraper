@@ -129,15 +129,16 @@ async fn scrape_directory(
         }
         match client.get(url).send().await {
             Ok(resp) => {
-                let status = resp.status().as_u16();
-                if status == 429 {
+                let status = resp.status();
+                if !status.is_success() {
+                    eprintln!("[!] HTTP status {} received from {}. Please change proxy and press Enter to retry...", status, url);
                     pause_for_proxy_change();
                     continue;
                 }
                 match resp.text().await {
                     Ok(body) => break body,
                     Err(e) => {
-                        eprintln!("[!] Error reading body from {}: {}. Please change proxy and press Enter to retry...", url, e);
+                        eprintln!("[!] Error reading body from {}: {}. Change proxy and press Enter to retry...", url, e);
                         pause_for_proxy_change();
                         continue;
                     }
@@ -264,8 +265,9 @@ async fn download_file(client: &Client, url: &str, file_path: &str) -> Result<()
         }
         match client.get(url).send().await {
             Ok(resp) => {
-                let status = resp.status().as_u16();
-                if status == 429 {
+                let status = resp.status();
+                if !status.is_success() {
+                    eprintln!("[!] HTTP status {} received for {}. Change proxy and press Enter to retry...", status, url);
                     pause_for_proxy_change();
                     continue;
                 }
