@@ -18,12 +18,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Global rate limit in seconds between HTTP requests (0 = no limit)
 static RATE_LIMIT_SECS: AtomicU64 = AtomicU64::new(0);
-/// Pause execution waiting for user to change proxies
-fn pause_for_proxy_change() {
-    eprintln!("[!] Rate limit or network error detected. Please change your proxy and press Enter to resume...");
-    let mut buf = String::new();
-    let _ = std::io::stdin().read_line(&mut buf);
-}
 
 
 // async fn => 
@@ -121,36 +115,13 @@ async fn scrape_directory(
     visited.insert(current_dir.clone());
     println!("Visited directories: {:?}", visited);
 
-    // fetch page with rate-limit and retry on rate-limit or network errors
-    let response_text = loop {
-        let rl = RATE_LIMIT_SECS.load(Ordering::Relaxed);
-        if rl > 0 {
-            sleep(Duration::from_secs(rl)).await;
-        }
-        match client.get(url).send().await {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                if status == 429 {
-                    pause_for_proxy_change();
-                    continue;
-                }
-                match resp.text().await {
-                    Ok(body) => break body,
-                    Err(e) => {
-                        eprintln!("[!] Error reading body from {}: {}. Please change proxy and press Enter to retry...", url, e);
-                        pause_for_proxy_change();
-                        continue;
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[!] HTTP request to {} failed: {}. Please change proxy and press Enter to retry...", url, e);
-                pause_for_proxy_change();
-                continue;
-            }
-        }
-    };
-    let document = Html::parse_document(&response_text);
+    // apply rate limit between requests if set
+    let rl = RATE_LIMIT_SECS.load(Ordering::Relaxed);
+    if rl > 0 {
+        sleep(Duration::from_secs(rl)).await;
+    }
+    let response = client.get(url).send().await?.text().await?;
+    let document = Html::parse_document(&response);
 
     // check for .pdf or .zip files
     let link_selector =
@@ -218,7 +189,7 @@ async fn scrape_directory(
             Selector::parse(r#"div.cursor-pointer span.text-white.text-xs.truncate"#).unwrap();
         let mut categories: Vec<String> = document
             .select(&category_selector)
-            .map(|e| e.inner_html().trim().to_string())
+            .map(|e| e.text().collect::<Vec<_>>().join("").trim().to_string())
             .collect();
 
         // filter out dirs, if they are visited !
@@ -256,35 +227,13 @@ async fn scrape_directory(
 }
 
 async fn download_file(client: &Client, url: &str, file_path: &str) -> Result<(), reqwest::Error> {
-    // fetch file with rate-limit and retry on rate-limit or network errors
-    let bytes = loop {
-        let rl = RATE_LIMIT_SECS.load(Ordering::Relaxed);
-        if rl > 0 {
-            sleep(Duration::from_secs(rl)).await;
-        }
-        match client.get(url).send().await {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                if status == 429 {
-                    pause_for_proxy_change();
-                    continue;
-                }
-                match resp.bytes().await {
-                    Ok(b) => break b,
-                    Err(e) => {
-                        eprintln!("[!] Error reading bytes from {}: {}. Change proxy and press Enter to retry...", url, e);
-                        pause_for_proxy_change();
-                        continue;
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[!] HTTP request to {} failed: {}. Change proxy and press Enter to retry...", url, e);
-                pause_for_proxy_change();
-                continue;
-            }
-        }
-    };
+    // apply rate limit between requests if set
+    let rl = RATE_LIMIT_SECS.load(Ordering::Relaxed);
+    if rl > 0 {
+        sleep(Duration::from_secs(rl)).await;
+    }
+    let response = client.get(url).send().await?;
+    let bytes = response.bytes().await?;
 
     if let Some(parent) = std::path::Path::new(file_path).parent() {
         fs::create_dir_all(parent).unwrap();
