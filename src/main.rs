@@ -3,9 +3,9 @@
     @5mukx
 */
 
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::StreamExt;
 use regex::Regex;
-use reqwest::Client;
+use reqwest::{Client, header::ACCEPT_ENCODING};
 use scraper::{Html, Selector};
 use std::path::Path;
 use std::collections::HashSet;
@@ -14,11 +14,13 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 /// Global rate limit in seconds between HTTP requests (0 = no limit)
 static RATE_LIMIT_SECS: AtomicU64 = AtomicU64::new(0);
+/// Maximum number of concurrent download tasks per directory (0 = unlimited)
+static CONCURRENCY: AtomicUsize = AtomicUsize::new(0);
 /// Pause execution waiting for network switching and resume after countdown
 fn pause_for_proxy_change() {
     eprintln!("[!] Rate limit or network error detected.");
@@ -44,6 +46,7 @@ async fn main() -> Result<(), reqwest::Error> {
     let base_url = "https://vx-underground.org";
     let mut start_path: Option<String> = None;
     let mut root_dir = String::from("Downloads");
+    // default no concurrency limit (0 = unlimited)
 
     let mut i = 1;
     while i < args.len() {
@@ -66,6 +69,18 @@ async fn main() -> Result<(), reqwest::Error> {
                     std::process::exit(1);
                 });
                 RATE_LIMIT_SECS.store(secs, Ordering::Relaxed);
+                i += 2;
+            }
+            "-c" | "--concurrency" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: {} requires a value", args[i]);
+                    std::process::exit(1);
+                }
+                let c = args[i + 1].parse::<usize>().unwrap_or_else(|_| {
+                    eprintln!("Error: invalid concurrency value: {}", args[i + 1]);
+                    std::process::exit(1);
+                });
+                CONCURRENCY.store(c, Ordering::Relaxed);
                 i += 2;
             }
             other => {
@@ -97,9 +112,13 @@ async fn main() -> Result<(), reqwest::Error> {
     }
 
     println!("[*] Press Enter to Start Processing =>");
-
     std::io::stdin().read_line(&mut String::new()).unwrap();
     std::io::stdout().flush().unwrap();
+    // show concurrency limit if set
+    let concurrency_limit = CONCURRENCY.load(Ordering::Relaxed);
+    if concurrency_limit > 0 {
+        println!("[*] Concurrency limit per directory: {}", concurrency_limit);
+    }
 
     let client = Arc::new(Client::builder().build()?);
     let mp = Arc::new(MultiProgress::new());
@@ -196,26 +215,29 @@ async fn scrape_directory(
             url,
             links.iter().map(|(name, _)| name).collect::<Vec<_>>()
         );
-        let mut download_tasks = FuturesUnordered::new();
-        for (name, href) in links {
+        // bounded concurrency per directory via stream buffer_unordered
+        let concurrency = CONCURRENCY.load(Ordering::Relaxed) as usize;
+        let max_concurrency = if concurrency == 0 { links.len() } else { concurrency };
+        futures::stream::iter(links.into_iter().map(|(name, href)| {
             let client = Arc::clone(&client);
-            let file_path = format!("{}/{}", dir, name);
-            if Path::new(&file_path).exists() {
-                println!("Skipping {}: already exists at {}", name, file_path);
-                continue;
-            }
-            let file_url = if href.starts_with("http") {
-                href
-            } else {
-                format!("{}{}", base_url, href)
-            };
-            let mp_cloned = mp.clone();
-
-            download_tasks.push(tokio::spawn(async move {
+            let mp = mp.clone();
+            let base_url = base_url.to_string();
+            let dir = dir.to_string();
+            async move {
+                let file_path = format!("{}/{}", dir, name);
+                if Path::new(&file_path).exists() {
+                    println!("Skipping {}: already exists at {}", name, file_path);
+                    return;
+                }
+                let file_url = if href.starts_with("http") {
+                    href
+                } else {
+                    format!("{}{}", base_url, href)
+                };
                 println!("Downloading {} to {}", name, file_path);
                 let mut success = false;
                 for attempt in 1..=3 {
-                    match download_file(&client, &file_url, &file_path, mp_cloned.clone()).await {
+                    match download_file(&client, &file_url, &file_path, mp.clone()).await {
                         Ok(_) => {
                             println!("Saved {} to {}", name, file_path);
                             success = true;
@@ -229,11 +251,11 @@ async fn scrape_directory(
                                 } else {
                                     eprintln!("[*] Waiting for network switching to take effect...");
                                     for remaining in (1..=10).rev() {
-                                        eprint!("\r[*] Retrying in {} seconds...", remaining);
+                                        eprint!("\\r[*] Retrying in {} seconds...", remaining);
                                         std::io::stdout().flush().unwrap();
                                         sleep(Duration::from_secs(1)).await;
                                     }
-                                    eprintln!("\r[*] Resuming now...");
+                                    eprintln!("\\r[*] Resuming now...");
                                 }
                             }
                         }
@@ -242,13 +264,11 @@ async fn scrape_directory(
                 if !success {
                     eprintln!("[!] Failed to download {} after 3 attempts, skipping.", name);
                 }
-            }));
-        }
-        while let Some(res) = download_tasks.next().await {
-            if let Err(e) = res {
-                eprintln!("Download task failed in {}: {}", dir, e);
             }
-        }
+        }))
+        .buffer_unordered(max_concurrency)
+        .for_each(|_| async {})
+        .await;
     } else {
 
         let category_selector =
@@ -302,7 +322,9 @@ async fn download_file(client: &Client, url: &str, file_path: &str, mp: Arc<Mult
     if rl > 0 {
         sleep(Duration::from_secs(rl)).await;
     }
+    // request raw stream without content decoding to avoid loading large bodies into memory
     let mut resp = client.get(url)
+        .header(ACCEPT_ENCODING, "identity")
         .send()
         .await?
         .error_for_status()?;
