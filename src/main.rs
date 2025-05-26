@@ -15,6 +15,7 @@ use std::io::Write;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
 use std::sync::atomic::{AtomicU64, Ordering};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 /// Global rate limit in seconds between HTTP requests (0 = no limit)
 static RATE_LIMIT_SECS: AtomicU64 = AtomicU64::new(0);
@@ -101,6 +102,7 @@ async fn main() -> Result<(), reqwest::Error> {
     std::io::stdout().flush().unwrap();
 
     let client = Arc::new(Client::builder().build()?);
+    let mp = Arc::new(MultiProgress::new());
     println!("Starting scrape at URL: {}", start_url);
 
     let mut visited = HashSet::new();
@@ -109,7 +111,7 @@ async fn main() -> Result<(), reqwest::Error> {
     } else {
         Vec::new()
     };
-    scrape_directory(client, base_url, &start_url, &root_dir, &mut visited, &skip_segments).await?;
+    scrape_directory(client, base_url, &start_url, &root_dir, &mut visited, &skip_segments, mp.clone()).await?;
 
     println!("Scraping and downloading complete!");
     Ok(())
@@ -122,6 +124,7 @@ async fn scrape_directory(
     dir: &str,
     visited: &mut HashSet<String>,
     skip_segments: &[String],
+    mp: Arc<MultiProgress>,
 ) -> Result<(), reqwest::Error> {
     println!("Processing URL: {} | Saving to directory: {}", url, dir);
 
@@ -206,12 +209,13 @@ async fn scrape_directory(
             } else {
                 format!("{}{}", base_url, href)
             };
+            let mp_cloned = mp.clone();
 
             download_tasks.push(tokio::spawn(async move {
                 println!("Downloading {} to {}", name, file_path);
                 let mut success = false;
                 for attempt in 1..=3 {
-                    match download_file(&client, &file_url, &file_path).await {
+                    match download_file(&client, &file_url, &file_path, mp_cloned.clone()).await {
                         Ok(_) => {
                             println!("Saved {} to {}", name, file_path);
                             success = true;
@@ -279,6 +283,7 @@ async fn scrape_directory(
                 &category_dir,
                 visited,
                 skip_segments,
+                mp.clone(),
             ));
 
             if let Err(e) = recursive_call.await {
@@ -292,24 +297,44 @@ async fn scrape_directory(
     Ok(())
 }
 
-async fn download_file(client: &Client, url: &str, file_path: &str) -> Result<(), reqwest::Error> {
-    // single attempt fetch with rate-limit, return error on failure
+async fn download_file(client: &Client, url: &str, file_path: &str, mp: Arc<MultiProgress>) -> Result<(), reqwest::Error> {
     let rl = RATE_LIMIT_SECS.load(Ordering::Relaxed);
     if rl > 0 {
         sleep(Duration::from_secs(rl)).await;
     }
-    let resp = client.get(url)
+    let mut resp = client.get(url)
         .send()
         .await?
         .error_for_status()?;
-    let bytes = resp.bytes().await?;
+    let total_size = resp.content_length().unwrap_or(0);
+    let show_progress = total_size > 50 * 1024 * 1024;
 
     if let Some(parent) = std::path::Path::new(file_path).parent() {
         fs::create_dir_all(parent).unwrap();
     }
-
     let mut file = File::create(file_path).unwrap();
-    file.write_all(&bytes).unwrap();
+    let pb = if show_progress {
+        let pb = mp.add(ProgressBar::new(total_size));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{prefix} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent:.2}%)")
+                .unwrap()
+                .progress_chars("=>-")
+        );
+        pb.set_prefix(file_path.to_string());
+        Some(pb)
+    } else {
+        None
+    };
+    while let Some(chunk) = resp.chunk().await? {
+        file.write_all(&chunk).unwrap();
+        if let Some(pb) = &pb {
+            pb.inc(chunk.len() as u64);
+        }
+    }
+    if let Some(pb) = pb {
+        pb.finish_with_message("done");
+    }
     Ok(())
 }
 
