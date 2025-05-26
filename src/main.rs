@@ -7,7 +7,6 @@ use futures::stream::StreamExt;
 use regex::Regex;
 use reqwest::{Client, header::{ACCEPT_ENCODING, CONTENT_LENGTH}};
 use scraper::{Html, Selector};
-use std::path::Path;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fs::{self, File};
@@ -17,6 +16,7 @@ use tokio::time::{Duration, sleep};
 use std::sync::atomic::{AtomicU64, AtomicUsize, AtomicBool, Ordering};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tokio::process::Command;
+use std::path::{Path, PathBuf};
 
 /// Global rate limit in seconds between HTTP requests (0 = no limit)
 static RATE_LIMIT_SECS: AtomicU64 = AtomicU64::new(0);
@@ -26,6 +26,77 @@ static CONCURRENCY: AtomicUsize = AtomicUsize::new(0);
 static USE_ARIA: AtomicBool = AtomicBool::new(false);
 /// Only invoke aria2c for files larger than this threshold in bytes (0 = always when -a)
 static ARIA_THRESHOLD: AtomicU64 = AtomicU64::new(0);
+/// Scan the given directory recursively for .aria2 control files
+fn collect_aria2_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_aria2_files(&path, out);
+            } else if path.extension().map(|e| e == "aria2").unwrap_or(false) {
+                out.push(path);
+            }
+        }
+    }
+}
+
+/// Resume any pending aria2 downloads found under root_dir
+async fn resume_pending_downloads(root_dir: &str) {
+    let root = Path::new(root_dir);
+    let mut control_files = Vec::new();
+    println!("[*] Scanning '{}' for pending .aria2 control files...", root_dir);
+    collect_aria2_files(root, &mut control_files);
+    println!("[*] Found {} pending .aria2 control files", control_files.len());
+    if control_files.is_empty() {
+        return;
+    }
+    println!("[*] Resuming {} pending aria2 downloads...", control_files.len());
+    for control in control_files {
+        // derive original file path (remove .aria2 extension)
+        let mut file_path = control.clone();
+        file_path.set_extension("");
+        let name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let dir = file_path.parent().and_then(|d| d.to_str()).unwrap_or("");
+        // read URL from control file (first 'uri=' line)
+        let content = std::fs::read_to_string(&control).unwrap_or_default();
+        if let Some(line) = content.lines().find(|l| l.starts_with("uri=")) {
+            let url = &line[4..];
+            println!("[*] Resuming download {} from {}", name, url);
+            let mut cmd = Command::new("aria2c");
+            cmd.arg("-c").arg("--auto-file-renaming=false");
+            cmd.arg("-d").arg(dir).arg("-o").arg(name).arg(url);
+            if let Ok(opts) = std::env::var("ARIA_OPTS") {
+                for token in opts.split_whitespace() {
+                    cmd.arg(token);
+                }
+            }
+            match cmd.status().await {
+                Ok(s) if s.success() => println!("[+] Resumed and completed {}", name),
+                Ok(s) => eprintln!("[!] aria2c exited {} while resuming {}", s, name),
+                Err(e) => eprintln!("[!] Failed to start aria2c for {}: {}", name, e),
+            }
+        } else {
+            eprintln!("[!] No URI found in control file {:?}, skipping", control);
+        }
+    }
+}
+/// Print usage information and exit
+fn print_help() {
+    println!("vxug-scraper: A fast and efficient web scraper for vx-underground.org");
+    println!();
+    println!("Usage:");
+    println!("  vxug-scraper [OPTIONS] [START_PATH]");
+    println!();
+    println!("Options:");
+    println!("  -o, --output-dir <DIR>         Set output directory (default: Downloads)");
+    println!("  -r, --rate-limit <SECONDS>     Rate limit between HTTP requests (seconds)");
+    println!("  -c, --concurrency <NUM>        Max concurrent downloads per directory (0=unlimited)");
+    println!("  -a, --aria                     Use aria2c for downloads");
+    println!("  --aria-opts <OPTS>             Extra options to pass to aria2c");
+    println!("  --aria-threshold <BYTES>       Only use aria2c for files larger than this size");
+    println!("  -h, --help                     Print this help message and exit");
+    println!();
+}
 /// Pause execution waiting for network switching and resume after countdown
 fn pause_for_proxy_change() {
     eprintln!("[!] Rate limit or network error detected.");
@@ -47,6 +118,10 @@ fn pause_for_proxy_change() {
 #[tokio::main]
 async fn main() -> Result<(), reqwest::Error> {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print_help();
+        return Ok(());
+    }
 
     let base_url = "https://vx-underground.org";
     let mut start_path: Option<String> = None;
@@ -150,6 +225,8 @@ async fn main() -> Result<(), reqwest::Error> {
     }
     if USE_ARIA.load(Ordering::Relaxed) {
         println!("[*] Using aria2c for downloads");
+        // First, resume any pending aria2 downloads before continuing
+        resume_pending_downloads(&root_dir).await;
     }
 
     let client = Arc::new(Client::builder().build()?);
@@ -308,10 +385,10 @@ async fn scrape_directory(
                             .arg("--auto-file-renaming=false")
                             .arg("-d").arg(&dir)
                             .arg("-o").arg(&name);
-                        if let Ok(opts) = std::env::var("ARIA_OPTS") {
-                            for token in opts.split_whitespace() {
-                                cmd.arg(token);
-                            }
+                        // Apply aria2c options: user-provided or default for higher concurrency
+                        let aria_opts = std::env::var("ARIA_OPTS").unwrap_or_else(|_| "-x 4 -s 4".to_string());
+                        for token in aria_opts.split_whitespace() {
+                            cmd.arg(token);
                         }
                         cmd.arg(&file_url);
                         let status = cmd.status().await;

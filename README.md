@@ -30,6 +30,7 @@ Recursive Scraping: Automatically crawls subdirectories on vx-underground.org to
 * User-Friendly Interface: Displays a banner and progress updates during scraping.
 * Concurrency Control: Limit the number of simultaneous downloads per directory (`-c`, `--concurrency`).
 * aria2c Integration: Optionally use `aria2c` for downloads (`-a`, `--aria`) and pass extra arguments with `--aria-opts`.
+* Pre-resume Paused Downloads: When aria2c is enabled (`-a`), the scraper scans for existing `.aria2` control files in the output directory and resumes those downloads before scraping proceeds.
 
 ### Prerequisites
 
@@ -61,6 +62,9 @@ cargo run --release
 ### USAGE:
 
  > ⚠️ Use Tool with Caution. You may get banned temporary if you misuse this tool !
+
+ Show help at any time with `-h` or `--help`.
+ When aria2c is enabled (`-a`), the scraper will first resume any incomplete downloads by scanning for `.aria2` control files in the output directory.
  
  You can optionally specify an output directory with `-o` or `--output-dir`. If not provided, defaults to `Downloads`.
  
@@ -86,6 +90,7 @@ By default, the scraper uses its internal HTTP downloader. To enable `aria2c` fo
 ```bash
 cargo run --release -- -a Papers
 ```
+By default, when using `aria2c`, the scraper applies `-x 4 -s 4` for multi-connection downloads. To override or customize, use `--aria-opts`.
 
 You can pass extra options to `aria2c` with `--aria-opts`. For example:
 
