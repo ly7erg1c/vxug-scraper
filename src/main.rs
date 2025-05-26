@@ -5,7 +5,7 @@
 
 use futures::stream::StreamExt;
 use regex::Regex;
-use reqwest::{Client, header::ACCEPT_ENCODING};
+use reqwest::{Client, header::{ACCEPT_ENCODING, CONTENT_LENGTH}};
 use scraper::{Html, Selector};
 use std::path::Path;
 use std::collections::HashSet;
@@ -24,6 +24,8 @@ static RATE_LIMIT_SECS: AtomicU64 = AtomicU64::new(0);
 static CONCURRENCY: AtomicUsize = AtomicUsize::new(0);
 /// Use aria2c for downloads (enable with -a or --aria)
 static USE_ARIA: AtomicBool = AtomicBool::new(false);
+/// Only invoke aria2c for files larger than this threshold in bytes (0 = always when -a)
+static ARIA_THRESHOLD: AtomicU64 = AtomicU64::new(0);
 /// Pause execution waiting for network switching and resume after countdown
 fn pause_for_proxy_change() {
     eprintln!("[!] Rate limit or network error detected.");
@@ -96,6 +98,18 @@ async fn main() -> Result<(), reqwest::Error> {
                     std::process::exit(1);
                 }
                 unsafe { std::env::set_var("ARIA_OPTS", &args[i + 1]); }
+                i += 2;
+            }
+            "--aria-threshold" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: {} requires a value", args[i]);
+                    std::process::exit(1);
+                }
+                let th = args[i + 1].parse::<u64>().unwrap_or_else(|_| {
+                    eprintln!("Error: invalid aria-threshold value: {}", args[i + 1]);
+                    std::process::exit(1);
+                });
+                ARIA_THRESHOLD.store(th, Ordering::Relaxed);
                 i += 2;
             }
             other => {
@@ -243,9 +257,14 @@ async fn scrape_directory(
             let dir = dir.to_string();
             async move {
                 let file_path = format!("{}/{}", dir, name);
+                let aria2_control = format!("{}.aria2", file_path);
                 if Path::new(&file_path).exists() {
-                    println!("Skipping {}: already exists at {}", name, file_path);
-                    return;
+                    if USE_ARIA.load(Ordering::Relaxed) && Path::new(&aria2_control).exists() {
+                        println!("Resuming incomplete download for {} (found .aria2)", name);
+                    } else {
+                        println!("Skipping {}: already exists at {}", name, file_path);
+                        return;
+                    }
                 }
                 let file_url = if href.starts_with("http") {
                     href
@@ -253,9 +272,37 @@ async fn scrape_directory(
                     format!("{}{}", base_url, href)
                 };
                 println!("Downloading {} to {}", name, file_path);
+                // Determine per-file if aria2c should be used based on threshold
+                let mut use_aria_for_file = USE_ARIA.load(Ordering::Relaxed);
+                let threshold = ARIA_THRESHOLD.load(Ordering::Relaxed);
+                if use_aria_for_file && threshold > 0 {
+                    match client.head(&file_url).send().await {
+                        Ok(resp) => {
+                            if let Some(len_header) = resp.headers().get(CONTENT_LENGTH) {
+                                if let Ok(len_str) = len_header.to_str() {
+                                    if let Ok(len) = len_str.parse::<u64>() {
+                                        if len <= threshold {
+                                            use_aria_for_file = false;
+                                        }
+                                    } else {
+                                        use_aria_for_file = false;
+                                    }
+                                } else {
+                                    use_aria_for_file = false;
+                                }
+                            } else {
+                                use_aria_for_file = false;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[!] Failed to HEAD {}: {}, falling back to HTTP download", file_url, e);
+                            use_aria_for_file = false;
+                        }
+                    }
+                }
                 let mut success = false;
                 for attempt in 1..=3 {
-                    if USE_ARIA.load(Ordering::Relaxed) {
+                    if use_aria_for_file {
                         let mut cmd = Command::new("aria2c");
                         cmd.arg("-c")
                             .arg("--auto-file-renaming=false")

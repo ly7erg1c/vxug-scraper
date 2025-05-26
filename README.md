@@ -92,6 +92,13 @@ You can pass extra options to `aria2c` with `--aria-opts`. For example:
 ```bash
 cargo run --release -- -a --aria-opts "-x 10 -s 2" Papers
 ```
+Use `--aria-threshold` to only invoke aria2c for files larger than a given size (in bytes). For example, to limit aria2c to files over 100 MB (104857600 bytes):
+
+```bash
+cargo run --release -- -a --aria-threshold 104857600 Papers
+```
+
+Note: Some servers may not support segmented range requests, leading to "Invalid range header" errors. If you encounter these, omit `-a`, or adjust `--aria-opts` (e.g., reduce connections or remove split downloads).
 
 Or combine with output-dir and collection:
 
