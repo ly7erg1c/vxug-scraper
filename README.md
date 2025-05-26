@@ -28,6 +28,8 @@ Recursive Scraping: Automatically crawls subdirectories on vx-underground.org to
 * Organized Storage: Saves files in a directory structure mirroring the website's hierarchy.
 * Visited URL Tracking: Prevents redundant scraping of already processed directories.
 * User-Friendly Interface: Displays a banner and progress updates during scraping.
+* Concurrency Control: Limit the number of simultaneous downloads per directory (`-c`, `--concurrency`).
+* aria2c Integration: Optionally use `aria2c` for downloads (`-a`, `--aria`) and pass extra arguments with `--aria-opts`.
 
 ### Prerequisites
 
@@ -72,6 +74,23 @@ You can also limit the time between requests using `-r` or `--rate-limit`. For e
 
 ```bash
 cargo run --release -- -r 5
+```
+Limit the number of concurrent downloads per directory using `-c` or `--concurrency`. For example, allow up to 5 simultaneous downloads:
+
+```bash
+cargo run --release -- -c 5
+```
+
+By default, the scraper uses its internal HTTP downloader. To enable `aria2c` for downloads, add the `-a` or `--aria` flag:
+
+```bash
+cargo run --release -- -a Papers
+```
+
+You can pass extra options to `aria2c` with `--aria-opts`. For example:
+
+```bash
+cargo run --release -- -a --aria-opts "-x 10 -s 2" Papers
 ```
 
 Or combine with output-dir and collection:
