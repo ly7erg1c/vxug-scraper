@@ -14,13 +14,16 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::sync::Arc;
 use tokio::time::{Duration, sleep};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, AtomicBool, Ordering};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use tokio::process::Command;
 
 /// Global rate limit in seconds between HTTP requests (0 = no limit)
 static RATE_LIMIT_SECS: AtomicU64 = AtomicU64::new(0);
 /// Maximum number of concurrent download tasks per directory (0 = unlimited)
 static CONCURRENCY: AtomicUsize = AtomicUsize::new(0);
+/// Use aria2c for downloads (enable with -a or --aria)
+static USE_ARIA: AtomicBool = AtomicBool::new(false);
 /// Pause execution waiting for network switching and resume after countdown
 fn pause_for_proxy_change() {
     eprintln!("[!] Rate limit or network error detected.");
@@ -83,6 +86,18 @@ async fn main() -> Result<(), reqwest::Error> {
                 CONCURRENCY.store(c, Ordering::Relaxed);
                 i += 2;
             }
+            "-a" | "--aria" => {
+                USE_ARIA.store(true, Ordering::Relaxed);
+                i += 1;
+            }
+            "--aria-opts" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: {} requires a value", args[i]);
+                    std::process::exit(1);
+                }
+                unsafe { std::env::set_var("ARIA_OPTS", &args[i + 1]); }
+                i += 2;
+            }
             other => {
                 if start_path.is_some() {
                     eprintln!("Warning: multiple paths specified, using first: {}", other);
@@ -118,6 +133,9 @@ async fn main() -> Result<(), reqwest::Error> {
     let concurrency_limit = CONCURRENCY.load(Ordering::Relaxed);
     if concurrency_limit > 0 {
         println!("[*] Concurrency limit per directory: {}", concurrency_limit);
+    }
+    if USE_ARIA.load(Ordering::Relaxed) {
+        println!("[*] Using aria2c for downloads");
     }
 
     let client = Arc::new(Client::builder().build()?);
@@ -237,27 +255,50 @@ async fn scrape_directory(
                 println!("Downloading {} to {}", name, file_path);
                 let mut success = false;
                 for attempt in 1..=3 {
-                    match download_file(&client, &file_url, &file_path, mp.clone()).await {
-                        Ok(_) => {
-                            println!("Saved {} to {}", name, file_path);
-                            success = true;
-                            break;
-                        }
-                        Err(e) => {
-                            eprintln!("Attempt {}/3 failed for {}: {}", attempt, name, e);
-                            if attempt < 3 {
-                                if attempt == 1 {
-                                    pause_for_proxy_change();
-                                } else {
-                                    eprintln!("[*] Waiting for network switching to take effect...");
-                                    for remaining in (1..=10).rev() {
-                                        eprint!("\\r[*] Retrying in {} seconds...", remaining);
-                                        std::io::stdout().flush().unwrap();
-                                        sleep(Duration::from_secs(1)).await;
-                                    }
-                                    eprintln!("\\r[*] Resuming now...");
-                                }
+                    if USE_ARIA.load(Ordering::Relaxed) {
+                        let mut cmd = Command::new("aria2c");
+                        cmd.arg("-c")
+                            .arg("--auto-file-renaming=false")
+                            .arg("-d").arg(&dir)
+                            .arg("-o").arg(&name);
+                        if let Ok(opts) = std::env::var("ARIA_OPTS") {
+                            for token in opts.split_whitespace() {
+                                cmd.arg(token);
                             }
+                        }
+                        cmd.arg(&file_url);
+                        let status = cmd.status().await;
+                        match status {
+                            Ok(s) if s.success() => {
+                                println!("Saved {} to {}", name, file_path);
+                                success = true;
+                            }
+                            Ok(s) => eprintln!("Attempt {}/3: aria2c exited with {} for {}", attempt, s, name),
+                            Err(e) => eprintln!("Attempt {}/3: failed to start aria2c for {}: {}", attempt, name, e),
+                        }
+                    } else {
+                        match download_file(&client, &file_url, &file_path, mp.clone()).await {
+                            Ok(_) => {
+                                println!("Saved {} to {}", name, file_path);
+                                success = true;
+                            }
+                            Err(e) => eprintln!("Attempt {}/3 failed for {}: {}", attempt, name, e),
+                        }
+                    }
+                    if success {
+                        break;
+                    }
+                    if attempt < 3 {
+                        if attempt == 1 {
+                            pause_for_proxy_change();
+                        } else {
+                            eprintln!("[*] Waiting for network switching to take effect...");
+                            for remaining in (1..=10).rev() {
+                                eprint!("\r[*] Retrying in {} seconds...", remaining);
+                                std::io::stdout().flush().unwrap();
+                                sleep(Duration::from_secs(1)).await;
+                            }
+                            eprintln!("\r[*] Resuming now...");
                         }
                     }
                 }
